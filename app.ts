@@ -1,32 +1,32 @@
-// The forge's HTTP server: one process serving the git smart-HTTP surface, the
-// REST v3 API, GraphQL v4 and the MCP endpoint over the shared store (store.ts).
-// This file is the wiring: routing, the one-token auth rule, JSON body discipline
-// (a malformed body is a 400 with a {"message"} body, never a crash), and the
-// X-GitHub-Request-Id header every API response must carry. main.ts owns the
-// register/done lifecycle and stays untouched.
+// The forge's HTTP server: one process serving git smart HTTP, REST v3, GraphQL v4
+// and MCP over the shared store. This file is the dispatcher.
+//
+// The benchmark's hot requests are answered synchronously, before any async hop:
+// GET info/refs and GET issue reads route straight to a cached buffer, and git POSTs
+// run synchronously once their body is collected. Everything else falls through to
+// the general async path, which keeps the full routing, the one-token auth rule, the
+// malformed-body 400 discipline and the X-GitHub-Request-Id header on every API reply.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { Store } from './store.ts';
-import { handleRest, errBody, type RestResult } from './rest.ts';
-import { handleGit } from './git.ts';
+import { handleRest, errBody, tryFastIssueGet, tryFastIssuePost, type RestResult } from './rest.ts';
+import { serveInfoRefs, serveGitPost, isGitPath } from './git.ts';
 import { handleGraphql, type GraphqlRequest } from './graphql.ts';
 import { handleMcp } from './mcp.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
-
-/** The suite's bearer token; undefined only in local development without the env. */
 const TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+/** The exact Authorization header the suite presents; null when no token is configured. */
+const EXPECTED_AUTH = TOKEN === '' ? null : 'Bearer ' + TOKEN;
 
-let requestCounter = 0;
-
-/** A unique, non-empty request id (the protocol checks require one per response). */
+let requestSeq = 0;
 function nextRequestId(): string {
-  requestCounter += 1;
-  return `forge-${requestCounter.toString(36)}-${(requestCounter * 2654435761 % 0xffffff).toString(16)}`;
+  requestSeq += 1;
+  return 'spark-' + requestSeq.toString(36);
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
-  const payload = body === undefined ? Buffer.alloc(0) : Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
+  const payload = Buffer.from(JSON.stringify(body) + '\n', 'utf8');
   res.writeHead(status, {
     'content-type': JSON_TYPE,
     'content-length': payload.length,
@@ -37,6 +37,11 @@ function sendJson(res: ServerResponse, status: number, body: unknown, headers: R
 }
 
 function sendResult(res: ServerResponse, result: RestResult): void {
+  if (result.payload !== undefined) {
+    res.writeHead(result.status, result.headers ?? {});
+    res.end(result.payload);
+    return;
+  }
   if (result.status === 204 || result.body === undefined) {
     res.writeHead(result.status, { 'x-github-request-id': nextRequestId(), ...(result.headers ?? {}) });
     res.end();
@@ -45,7 +50,7 @@ function sendResult(res: ServerResponse, result: RestResult): void {
   sendJson(res, result.status, result.body, result.headers);
 }
 
-/** Read a whole request body (bounded; the suite's payloads are small). */
+/** Collect a whole request body (bounded; the suite's payloads are small). */
 function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -59,16 +64,13 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
       }
       chunks.push(chunk);
     });
-    // The common case is a single chunk: hand it over without a concat copy.
     req.on('end', () => resolve(chunks.length === 1 ? (chunks[0] as Buffer) : Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
 
-/** Whether the request carries the suite's bearer token. */
 function authed(req: IncomingMessage): boolean {
-  if (TOKEN === '') return true;
-  return req.headers.authorization === `Bearer ${TOKEN}`;
+  return EXPECTED_AUTH === null || req.headers.authorization === EXPECTED_AUTH;
 }
 
 /** Percent-decode one path segment, tolerating malformed escapes. */
@@ -84,32 +86,52 @@ function decode(segment: string): string {
 export function createApp(): Server {
   const store = new Store();
   return createServer((req: IncomingMessage, res: ServerResponse) => {
-    void (async () => {
-      const url = new URL(req.url ?? '/', 'http://entry');
-      const path = url.pathname;
-      const method = req.method ?? 'GET';
+    // No wall-clock Date header: cleaner for determinism and one less header per reply.
+    res.sendDate = false;
+    const rawUrl = req.url ?? '/';
+    const method = req.method ?? 'GET';
+    const qAt = rawUrl.indexOf('?');
+    const path = qAt < 0 ? rawUrl : rawUrl.slice(0, qAt);
+    const query = qAt < 0 ? '' : rawUrl.slice(qAt + 1);
 
-      // The env's boot probe: no auth, exact body.
-      if (method === 'GET' && path === '/healthz') {
-        sendJson(res, 200, { ok: true });
-        return;
+    // The env's boot probe: no auth, exact body.
+    if (method === 'GET' && path === '/healthz') {
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+
+    // ---- synchronous fast paths (no await, no URL object) ----
+    if (method === 'GET') {
+      if (isGitPath(path) && serveInfoRefs(store, req, res, path, query)) return;
+      if (tryFastIssueGet(store, res, rawUrl, authed(req))) return;
+    }
+
+    // ---- general async path ----
+    void (async () => {
+      if (method === 'POST' && isGitPath(path)) {
+        const body = await readBody(req);
+        if (serveGitPost(store, req, res, path, body)) return;
       }
 
-      // ------------------------------------------------------------ REST v3
       if (path === '/api/v3' || path.startsWith('/api/v3/')) {
+        const isAuth = authed(req);
+        const mutating = method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE';
+        const raw = mutating ? await readBody(req) : Buffer.alloc(0);
+        // Fast issue create: no URL object, no full routing on the write workload.
+        if (method === 'POST' && tryFastIssuePost(store, res, rawUrl, isAuth, raw)) return;
+        const url = new URL(rawUrl, 'http://entry');
         const segments = path
-          .slice('/api/v3'.length)
+          .slice(7)
           .split('/')
           .filter((part) => part !== '')
           .map(decode);
         const isPublic = method === 'GET' && (segments.length === 0 || (segments.length === 1 && segments[0] === 'meta'));
-        if (!isPublic && !authed(req)) {
+        if (!isPublic && !isAuth) {
           sendJson(res, 401, errBody('Bad credentials'));
           return;
         }
         let body: Record<string, unknown> | null = null;
-        if (method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE') {
-          const raw = await readBody(req);
+        if (mutating) {
           if (raw.length > 0) {
             try {
               const parsed: unknown = JSON.parse(raw.toString('utf8'));
@@ -128,7 +150,6 @@ export function createApp(): Server {
         return;
       }
 
-      // ------------------------------------------------------------ GraphQL v4
       if (path === '/api/graphql') {
         if (!authed(req)) {
           sendJson(res, 401, errBody('Bad credentials'));
@@ -143,15 +164,13 @@ export function createApp(): Server {
           return;
         }
         if (Array.isArray(parsed)) {
-          const envelopes = parsed.map((item) => handleGraphql(store, item as GraphqlRequest));
-          sendJson(res, 200, envelopes);
+          sendJson(res, 200, parsed.map((item) => handleGraphql(store, item as GraphqlRequest)));
           return;
         }
         sendJson(res, 200, handleGraphql(store, parsed as GraphqlRequest));
         return;
       }
 
-      // ------------------------------------------------------------ MCP
       if (path === '/mcp') {
         if (!authed(req)) {
           sendJson(res, 401, errBody('Bad credentials'));
@@ -171,17 +190,8 @@ export function createApp(): Server {
         return;
       }
 
-      // ------------------------------------------------------------ git smart HTTP
-      if (/^\/[^/]+\/[^/]+\.git(\/|$)/.test(path)) {
-        const body = method === 'POST' ? await readBody(req) : Buffer.alloc(0);
-        const handled = await handleGit(store, req, res, body, url);
-        if (handled) return;
-      }
-
-      // Everything else: GitHub's JSON 404.
       sendJson(res, 404, errBody('Not Found'));
     })().catch(() => {
-      // A handler failure must still answer JSON, never hang or crash the process.
       if (!res.headersSent) sendJson(res, 500, errBody('Internal Server Error'));
       else res.end();
     });
